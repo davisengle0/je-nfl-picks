@@ -1,19 +1,41 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { supabase, normalizeName, fmtLocal } from "./supabase";
 import { isLocked, computeLeaderboard, computeMatchupStats } from "./logic";
 
 const ADMIN_KEY = "je_picks_admin_authed";
 
+const ROUND_ORDER = ["Wild Card", "Divisional", "Conference", "Super Bowl"];
+
+function roundSortKey(r) {
+  const idx = ROUND_ORDER.indexOf(r);
+  if (idx !== -1) return idx;
+  return 999; // unknown rounds go last
+}
+
+function matchupTitle(m) {
+  return `${m.team_a} vs ${m.team_b}`;
+}
+
 export default function App() {
   const [loading, setLoading] = useState(true);
+  const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
   const [toast, setToast] = useState("");
 
   const [contest, setContest] = useState(null);
-  const [matchups, setMatchups] = useState([]);
+
+  // NEW: keep current round matchups separate from all matchups
+  const [currentMatchups, setCurrentMatchups] = useState([]);
+  const [allMatchups, setAllMatchups] = useState([]);
+
   const [entries, setEntries] = useState([]);
   const [allPicks, setAllPicks] = useState([]);
 
   const [view, setView] = useState("home"); // home | picks | results | admin
+  const viewRef = useRef(view);
+  useEffect(() => {
+    viewRef.current = view;
+  }, [view]);
+
   const [first, setFirst] = useState("");
   const [last, setLast] = useState("");
   const [me, setMe] = useState(null);
@@ -21,7 +43,7 @@ export default function App() {
   const [myPicks, setMyPicks] = useState({}); // matchup_id -> 'A' | 'B'
 
   const locked = useMemo(() => isLocked(contest?.round_lock_utc), [contest?.round_lock_utc]);
-  const roundName = contest?.current_round_name || "Current Round";
+  const currentRoundName = contest?.current_round_name || "Current Round";
   const lockText = contest?.round_lock_utc ? fmtLocal(contest.round_lock_utc) : "Not set";
 
   useEffect(() => {
@@ -30,8 +52,8 @@ export default function App() {
     return () => clearTimeout(t);
   }, [toast]);
 
-  async function loadAll() {
-    setLoading(true);
+  async function loadAll({ showSpinner = false } = {}) {
+    if (showSpinner && !hasLoadedOnce) setLoading(true);
 
     const c = await supabase
       .from("contests")
@@ -42,49 +64,71 @@ export default function App() {
 
     if (c.error) {
       setToast(`Contest load error: ${c.error.message}`);
-      setLoading(false);
+      if (!hasLoadedOnce) setLoading(false);
       return;
     }
-    setContest(c.data);
+    const contestRow = c.data;
+    setContest(contestRow);
 
-    const round = c.data?.current_round_name;
-
-    const m = await supabase
+    // Fetch ALL matchups (all rounds) — key for multi-round results + cumulative scoring
+    const allM = await supabase
       .from("matchups")
       .select("*")
-      .eq("contest_id", c.data.id)
-      .eq("round_name", round)
+      .eq("contest_id", contestRow.id)
+      .order("round_name", { ascending: true })
       .order("game_order", { ascending: true });
 
-    if (m.error) setToast(`Matchups load error: ${m.error.message}`);
-    setMatchups(m.data || []);
+    if (allM.error) setToast(`All matchups load error: ${allM.error.message}`);
+    const allMatchupsRows = allM.data || [];
+    setAllMatchups(allMatchupsRows);
+
+    // Current round matchups for picks
+    const curM = allMatchupsRows.filter((m) => m.round_name === contestRow.current_round_name);
+    setCurrentMatchups(curM);
 
     const e = await supabase
       .from("entries")
       .select("*")
-      .eq("contest_id", c.data.id)
+      .eq("contest_id", contestRow.id)
       .order("created_at", { ascending: true });
 
     if (e.error) setToast(`Entries load error: ${e.error.message}`);
     setEntries(e.data || []);
 
-    const p = await supabase.from("picks").select("*").eq("contest_id", c.data.id);
+    const p = await supabase.from("picks").select("*").eq("contest_id", contestRow.id);
     if (p.error) setToast(`Picks load error: ${p.error.message}`);
     setAllPicks(p.data || []);
 
-    setLoading(false);
+    if (!hasLoadedOnce) {
+      setHasLoadedOnce(true);
+      setLoading(false);
+    }
   }
 
   useEffect(() => {
-    loadAll();
-    const t = setInterval(loadAll, 25000);
+    // initial load with spinner
+    loadAll({ showSpinner: true });
+
+    // background refresh; DO NOT refresh while on admin (avoid overwriting edits)
+    const t = setInterval(() => {
+      if (viewRef.current === "admin") return;
+      loadAll({ showSpinner: false });
+    }, 25000);
+
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Leaderboard now uses ALL matchups, so points accumulate across rounds.
   const leaderboard = useMemo(() => {
-    return computeLeaderboard(entries, matchups, allPicks);
-  }, [entries, matchups, allPicks]);
+    return computeLeaderboard(entries, allMatchups, allPicks);
+  }, [entries, allMatchups, allPicks]);
+
+  const rounds = useMemo(() => {
+    const set = new Set(allMatchups.map((m) => m.round_name));
+    if (currentRoundName) set.add(currentRoundName);
+    return Array.from(set).sort((a, b) => roundSortKey(a) - roundSortKey(b) || a.localeCompare(b));
+  }, [allMatchups, currentRoundName]);
 
   async function continueWithName() {
     const fn = first.trim();
@@ -94,7 +138,7 @@ export default function App() {
       return;
     }
     if (!contest) {
-      setToast("Contest not loaded yet. Try refresh.");
+      setToast("Contest not loaded yet.");
       return;
     }
 
@@ -116,10 +160,8 @@ export default function App() {
     let entry = existing.data;
 
     if (!entry) {
-      if (locked) {
-        setToast("Round is locked and no entry exists for that name.");
-        return;
-      }
+      // Allow creating entry any time. If locked, they still can view results and leaderboard,
+      // but they won't have picks for locked rounds unless they made them earlier.
       const ins = await supabase
         .from("entries")
         .insert([
@@ -138,12 +180,11 @@ export default function App() {
         return;
       }
       entry = ins.data;
-      await loadAll();
+      await loadAll({ showSpinner: false });
     }
 
     setMe(entry);
 
-    // load my picks
     const mp = await supabase
       .from("picks")
       .select("*")
@@ -159,6 +200,7 @@ export default function App() {
     for (const p of mp.data || []) map[p.matchup_id] = p.picked;
     setMyPicks(map);
 
+    // default view after login: picks if current round open, otherwise results
     setView(locked ? "results" : "picks");
   }
 
@@ -172,7 +214,6 @@ export default function App() {
       return;
     }
 
-    // instant UI
     setMyPicks((prev) => ({ ...prev, [matchupId]: picked }));
 
     const up = await supabase
@@ -195,28 +236,23 @@ export default function App() {
     }
 
     setToast("Saved");
-    await loadAll();
+    await loadAll({ showSpinner: false });
   }
 
-  function goHome() {
-    setView("home");
-  }
-
-  if (loading) {
+  if (loading && !hasLoadedOnce) {
     return <div style={styles.loading}>Loading…</div>;
   }
 
   return (
     <div style={styles.page}>
-      {/* Toast */}
       {toast && <div style={styles.toast}>{toast}</div>}
 
       {/* Header */}
       <div style={styles.topbar}>
         <div>
-          <div style={styles.brand}>JE NFL Picks</div>
+          <div style={styles.brand}>JECH NFL Playoff Picks</div>
           <div style={styles.subhead}>
-            <b>{roundName}</b> • Locks: <b>{lockText}</b> •{" "}
+            Current round: <b>{currentRoundName}</b> • Locks: <b>{lockText}</b> •{" "}
             <span style={{ color: locked ? "#b91c1c" : "#166534", fontWeight: 900 }}>
               {locked ? "LOCKED" : "OPEN"}
             </span>
@@ -224,24 +260,24 @@ export default function App() {
         </div>
 
         <div style={styles.nav}>
-          <button style={styles.navBtn} onClick={goHome}>
+          <button style={styles.navBtn} onClick={() => setView("home")}>
             Home
           </button>
 
           <button
             style={me ? styles.navBtn : styles.navBtnDisabled}
-            onClick={() => setView(locked ? "results" : "picks")}
+            onClick={() => setView("picks")}
             disabled={!me}
           >
-            {locked ? "Results" : "My Picks"}
+            Picks
+          </button>
+
+          <button style={styles.navBtn} onClick={() => setView("results")}>
+            Results
           </button>
 
           <button style={styles.navBtn} onClick={() => setView("admin")}>
             Admin
-          </button>
-
-          <button style={styles.navBtn} onClick={loadAll}>
-            Refresh
           </button>
         </div>
       </div>
@@ -250,32 +286,36 @@ export default function App() {
       <div style={styles.container}>
         {view === "home" && (
           <Card>
-            <h2 style={styles.h2}>{locked ? "View results" : "Make your picks"}</h2>
+            <h2 style={styles.h2}>Enter your name</h2>
             <p style={styles.p}>
-              {locked
-                ? "Enter your name to view your picks, score, public stats, and leaderboard."
-                : "Enter your name and tap winners. It auto-saves. You can change picks until lock time."}
+              Enter your name to make picks for the current round and view results + leaderboard across all rounds.
             </p>
 
             <div style={styles.formRow}>
               <div style={{ flex: 1 }}>
                 <div style={styles.label}>First name</div>
-                <input style={styles.input} value={first} onChange={(e) => setFirst(e.target.value)} />
+                <input
+                  style={styles.input}
+                  value={first}
+                  onChange={(e) => setFirst(e.target.value)}
+                  placeholder="Mike"
+                />
               </div>
               <div style={{ flex: 1 }}>
                 <div style={styles.label}>Last name</div>
-                <input style={styles.input} value={last} onChange={(e) => setLast(e.target.value)} />
+                <input
+                  style={styles.input}
+                  value={last}
+                  onChange={(e) => setLast(e.target.value)}
+                  placeholder="Smith"
+                />
               </div>
             </div>
 
             <div style={{ marginTop: 12 }}>
               <button style={styles.primaryBtn} onClick={continueWithName}>
-                {locked ? "View" : "Continue"}
+                Continue
               </button>
-            </div>
-
-            <div style={styles.tip}>
-              Admin tip: Use the Admin page to add games + set lock time + enter winners/scores.
             </div>
           </Card>
         )}
@@ -293,31 +333,25 @@ export default function App() {
                       {me.first_name} {me.last_name}
                     </div>
                     <div style={styles.p}>
-                      Tap the winner for each game. Picks auto-save.
+                      Current round: <b>{currentRoundName}</b> •{" "}
+                      {locked ? "Locked (you can’t change picks)" : "Open (tap winners to pick)"}
                     </div>
                   </div>
-                  <div style={styles.badgeOpen}>OPEN</div>
+                  <div style={locked ? styles.badgeLocked : styles.badgeOpen}>
+                    {locked ? "LOCKED" : "OPEN"}
+                  </div>
                 </div>
 
-                {matchups.length === 0 ? (
-                  <div style={styles.empty}>
-                    No games entered yet. (Admin needs to add matchups.)
-                  </div>
+                {currentMatchups.length === 0 ? (
+                  <div style={styles.empty}>No games entered yet for the current round.</div>
                 ) : (
                   <div style={styles.list}>
-                    {matchups.map((m) => {
+                    {currentMatchups.map((m) => {
                       const picked = myPicks[m.id] || null;
                       return (
                         <div key={m.id} style={styles.gameCard}>
                           <div style={styles.gameTop}>
-                            <div>
-                              <div style={styles.gameLabel}>{m.label || `Game ${m.game_order}`}</div>
-                              {m.start_time_utc && (
-                                <div style={styles.gameMeta}>
-                                  Starts: {new Date(m.start_time_utc).toLocaleString()}
-                                </div>
-                              )}
-                            </div>
+                            <div style={styles.gameTitle}>{matchupTitle(m)}</div>
                           </div>
 
                           <div style={styles.pickRow}>
@@ -325,13 +359,13 @@ export default function App() {
                               label={m.team_a}
                               active={picked === "A"}
                               onClick={() => setPick(m.id, "A")}
-                              disabled={false}
+                              disabled={locked}
                             />
                             <PickButton
                               label={m.team_b}
                               active={picked === "B"}
                               onClick={() => setPick(m.id, "B")}
-                              disabled={false}
+                              disabled={locked}
                             />
                           </div>
                         </div>
@@ -347,7 +381,8 @@ export default function App() {
         {view === "results" && (
           <ResultsHub
             me={me}
-            matchups={matchups}
+            rounds={rounds}
+            allMatchups={allMatchups}
             entries={entries}
             allPicks={allPicks}
             leaderboard={leaderboard}
@@ -355,232 +390,234 @@ export default function App() {
         )}
 
         {view === "admin" && (
-          <AdminPanel contest={contest} matchups={matchups} onUpdated={loadAll} setToast={setToast} />
+          <AdminPanel
+            contest={contest}
+            rounds={rounds}
+            allMatchups={allMatchups}
+            entries={entries}
+            allPicks={allPicks}
+            onUpdated={() => loadAll({ showSpinner: false })}
+            setToast={setToast}
+          />
         )}
       </div>
     </div>
   );
 }
 
-/* ---------------- UI Pieces ---------------- */
+/* ---------------- Results Hub ---------------- */
 
-function Card({ children }) {
-  return <div style={styles.card}>{children}</div>;
-}
+function ResultsHub({ me, rounds, allMatchups, entries, allPicks, leaderboard }) {
+  const [tab, setTab] = useState("leaderboard"); // leaderboard | round | my
+  const [selectedRound, setSelectedRound] = useState(rounds?.[0] || "");
 
-function PickButton({ label, active, disabled, onClick }) {
-  return (
-    <button
-      style={{
-        ...styles.teamBtn,
-        ...(active ? styles.teamBtnActive : null),
-        ...(disabled ? styles.teamBtnDisabled : null)
-      }}
-      disabled={disabled}
-      onClick={onClick}
-    >
-      {label}
-    </button>
-  );
-}
+  useEffect(() => {
+    if (!selectedRound && rounds?.length) setSelectedRound(rounds[0]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rounds?.length]);
 
-function ResultsHub({ me, matchups, entries, allPicks, leaderboard }) {
-  const [tab, setTab] = useState("me"); // me | stats | board
+  const matchupsInRound = useMemo(() => {
+    return allMatchups.filter((m) => m.round_name === selectedRound).sort((a, b) => (a.game_order ?? 0) - (b.game_order ?? 0));
+  }, [allMatchups, selectedRound]);
 
-  if (!me) {
-    return (
-      <Card>
-        <h2 style={styles.h2}>Enter your name first</h2>
-        <p style={styles.p}>Go to Home and log in with your name.</p>
-      </Card>
-    );
-  }
-
-  // compute my score this round so far (1 per correct pick)
-  const my = allPicks.filter((p) => p.entry_id === me.id);
-  const byMatchup = new Map(matchups.map((m) => [m.id, m]));
-
-  let points = 0;
-  for (const p of my) {
-    const m = byMatchup.get(p.matchup_id);
-    if (!m?.winner) continue;
-    if (p.picked === m.winner) points += 1;
-  }
+  // My points across ALL rounds
+  const myPoints = useMemo(() => {
+    if (!me) return null;
+    const byMatchup = new Map(allMatchups.map((m) => [m.id, m]));
+    let pts = 0;
+    for (const p of allPicks) {
+      if (p.entry_id !== me.id) continue;
+      const m = byMatchup.get(p.matchup_id);
+      if (!m?.winner) continue;
+      if (p.picked === m.winner) pts += 1;
+    }
+    return pts;
+  }, [me, allMatchups, allPicks]);
 
   return (
     <Card>
       <div style={styles.sectionHead}>
         <div>
-          <div style={styles.sectionKicker}>Round locked</div>
-          <div style={styles.sectionTitle}>
-            {me.first_name} {me.last_name}
-          </div>
+          <div style={styles.sectionKicker}>Results</div>
+          <div style={styles.sectionTitle}>Playoffs</div>
           <div style={styles.p}>
-            Your points so far: <b>{points}</b>
+            Leaderboard is cumulative across all rounds. Round stats show pick % and who picked what.
           </div>
+          {me && (
+            <div style={styles.p}>
+              Your total points so far: <b>{myPoints ?? 0}</b>
+            </div>
+          )}
         </div>
-        <div style={styles.badgeLocked}>LOCKED</div>
       </div>
 
       <div style={styles.tabs}>
-        <button style={tab === "me" ? styles.tabActive : styles.tab} onClick={() => setTab("me")}>
-          My picks
+        <button style={tab === "leaderboard" ? styles.tabActive : styles.tab} onClick={() => setTab("leaderboard")}>
+          Leaderboard
         </button>
-        <button style={tab === "stats" ? styles.tabActive : styles.tab} onClick={() => setTab("stats")}>
+        <button style={tab === "round" ? styles.tabActive : styles.tab} onClick={() => setTab("round")}>
           Round stats
         </button>
-        <button style={tab === "board" ? styles.tabActive : styles.tab} onClick={() => setTab("board")}>
-          Leaderboard
+        <button style={tab === "my" ? styles.tabActive : styles.tab} onClick={() => setTab("my")}>
+          My picks
         </button>
       </div>
 
+      {tab !== "leaderboard" && (
+        <div style={{ marginTop: 12 }}>
+          <div style={styles.label}>Round</div>
+          <select
+            style={styles.select}
+            value={selectedRound}
+            onChange={(e) => setSelectedRound(e.target.value)}
+          >
+            {rounds.map((r) => (
+              <option key={r} value={r}>
+                {r}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
+
       <div style={{ marginTop: 14 }}>
-        {tab === "me" && <MyPicksLocked matchups={matchups} my={my} />}
-        {tab === "stats" && <RoundStats matchups={matchups} entries={entries} allPicks={allPicks} />}
-        {tab === "board" && <Leaderboard leaderboard={leaderboard} />}
+        {tab === "leaderboard" && <Leaderboard leaderboard={leaderboard} />}
+
+        {tab === "round" && (
+          <RoundStats
+            matchups={matchupsInRound}
+            entries={entries}
+            allPicks={allPicks}
+          />
+        )}
+
+        {tab === "my" && (
+          <MyPicksByRound
+            me={me}
+            matchups={matchupsInRound}
+            allPicks={allPicks}
+          />
+        )}
       </div>
     </Card>
   );
 }
 
-function MyPicksLocked({ matchups, my }) {
-  const pickByMatchup = new Map(my.map((p) => [p.matchup_id, p.picked]));
-
-  return (
-    <div style={styles.list}>
-      {matchups.map((m) => {
-        const pickedSide = pickByMatchup.get(m.id);
-        const pickedTeam = pickedSide ? (pickedSide === "A" ? m.team_a : m.team_b) : "(no pick)";
-        const correct = m.winner ? pickedSide === m.winner : null;
-
-        return (
-          <div key={m.id} style={styles.gameCard}>
-            <div style={styles.gameTop}>
-              <div>
-                <div style={styles.gameLabel}>{m.label || `Game ${m.game_order}`}</div>
-                <div style={styles.gameMeta}>
-                  Your pick: <b>{pickedTeam}</b>
-                </div>
-              </div>
-              {m.winner && (
-                <div style={{ textAlign: "right" }}>
-                  <div style={styles.gameMeta}>
-                    Winner: <b>{m.winner === "A" ? m.team_a : m.team_b}</b>
-                  </div>
-                  <div style={styles.gameMeta}>
-                    Final: {m.score_a ?? ""}-{m.score_b ?? ""}
-                  </div>
-                </div>
-              )}
-            </div>
-
-            {m.winner && (
-              <div style={{ marginTop: 10, fontWeight: 900, color: correct ? "#166534" : "#b91c1c" }}>
-                {correct ? "Correct (+1)" : "Wrong (+0)"}
-              </div>
-            )}
-          </div>
-        );
-      })}
-
-      {!matchups.length && <div style={styles.empty}>No games found.</div>}
-    </div>
-  );
-}
-
 function RoundStats({ matchups, entries, allPicks }) {
+  if (!matchups.length) {
+    return <div style={styles.empty}>No games found for this round yet.</div>;
+  }
+
   return (
     <div style={styles.list}>
       {matchups.map((m) => {
         const picksForMatchup = allPicks.filter((p) => p.matchup_id === m.id);
         const s = computeMatchupStats(m, entries, picksForMatchup);
 
+        const hasWinner = !!m.winner;
+
         return (
           <div key={m.id} style={styles.gameCard}>
             <div style={styles.gameTop}>
-              <div>
-                <div style={styles.gameLabel}>{m.label || `Game ${m.game_order}`}</div>
-                <div style={styles.gameMeta}>
-                  Total picks: <b>{s.total}</b>
+              <div style={styles.gameTitle}>{matchupTitle(m)}</div>
+              {hasWinner ? (
+                <div style={styles.winnerPill}>
+                  Winner: <b>{m.winner === "A" ? m.team_a : m.team_b}</b>{" "}
+                  <span style={{ opacity: 0.8 }}>
+                    ({m.score_a ?? ""}-{m.score_b ?? ""})
+                  </span>
                 </div>
-              </div>
-              {m.winner && (
-                <div style={{ textAlign: "right" }}>
-                  <div style={styles.gameMeta}>
-                    Winner: <b>{m.winner === "A" ? m.team_a : m.team_b}</b>
-                  </div>
-                  <div style={styles.gameMeta}>
-                    Final: {m.score_a ?? ""}-{m.score_b ?? ""}
-                  </div>
-                </div>
+              ) : (
+                <div style={styles.noWinnerPill}>No result yet</div>
               )}
             </div>
 
             <div style={styles.statsRow}>
-              <StatSide team={m.team_a} pct={s.aPct} count={s.aCount} names={s.aPickers} />
-              <StatSide team={m.team_b} pct={s.bPct} count={s.bCount} names={s.bPickers} />
+              <StatSide team={m.team_a} pct={s.aPct} count={s.aCount} names={s.aPickers} winning={m.winner === "A"} />
+              <StatSide team={m.team_b} pct={s.bPct} count={s.bCount} names={s.bPickers} winning={m.winner === "B"} />
             </div>
           </div>
         );
       })}
-
-      {!matchups.length && <div style={styles.empty}>No games found.</div>}
     </div>
   );
 }
 
-function StatSide({ team, pct, count, names }) {
+function MyPicksByRound({ me, matchups, allPicks }) {
+  if (!me) return <div style={styles.empty}>Enter your name on Home first.</div>;
+  if (!matchups.length) return <div style={styles.empty}>No games found for this round yet.</div>;
+
+  const myPicks = allPicks.filter((p) => p.entry_id === me.id);
+  const pickByMatchup = new Map(myPicks.map((p) => [p.matchup_id, p.picked]));
+
   return (
-    <div style={styles.statCol}>
-      <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-        <div style={{ fontWeight: 950 }}>{team}</div>
-        <div style={{ fontWeight: 900, color: "rgba(15,23,42,0.75)" }}>
-          {pct}% ({count})
-        </div>
-      </div>
+    <div style={styles.list}>
+      {matchups.map((m) => {
+        const pickedSide = pickByMatchup.get(m.id);
+        const pickedTeam = pickedSide ? (pickedSide === "A" ? m.team_a : m.team_b) : "(no pick)";
+        const hasWinner = !!m.winner;
 
-      <div style={styles.barBg}>
-        <div style={{ ...styles.barFill, width: `${pct}%` }} />
-      </div>
+        const correct = hasWinner ? pickedSide === m.winner : null;
 
-      <div style={styles.nameList}>{names.length ? names.join(", ") : "—"}</div>
-    </div>
-  );
-}
+        return (
+          <div key={m.id} style={styles.gameCard}>
+            <div style={styles.gameTop}>
+              <div style={styles.gameTitle}>{matchupTitle(m)}</div>
+              {hasWinner ? (
+                <div style={styles.winnerPill}>
+                  Winner: <b>{m.winner === "A" ? m.team_a : m.team_b}</b>{" "}
+                  <span style={{ opacity: 0.8 }}>
+                    ({m.score_a ?? ""}-{m.score_b ?? ""})
+                  </span>
+                </div>
+              ) : (
+                <div style={styles.noWinnerPill}>No result yet</div>
+              )}
+            </div>
 
-function Leaderboard({ leaderboard }) {
-  return (
-    <div style={styles.board}>
-      {leaderboard.map((r, idx) => (
-        <div key={r.entry_id} style={styles.boardRow}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <div style={styles.rankPill}>{idx + 1}</div>
-            <div style={{ fontWeight: 900 }}>{r.name}</div>
+            <div style={styles.p}>
+              Your pick: <b>{pickedTeam}</b>
+            </div>
+
+            {hasWinner && (
+              <div style={correct ? styles.correctLine : styles.wrongLine}>
+                {correct ? "Correct (+1)" : "Wrong (+0)"}
+              </div>
+            )}
           </div>
-          <div style={{ fontWeight: 950, fontSize: 18 }}>{r.points}</div>
-        </div>
-      ))}
-      {!leaderboard.length && <div style={styles.empty}>No entries yet.</div>}
+        );
+      })}
     </div>
   );
 }
 
-/* ---------------- Admin Panel (no JSON) ---------------- */
+/* ---------------- Admin Panel ---------------- */
 
-function AdminPanel({ contest, matchups, onUpdated, setToast }) {
+function AdminPanel({ contest, rounds, allMatchups, entries, allPicks, onUpdated, setToast }) {
   const [authed, setAuthed] = useState(localStorage.getItem(ADMIN_KEY) === "1");
   const [pw, setPw] = useState("");
 
-  // round settings
+  // Round settings (for current round)
   const [roundName, setRoundName] = useState(contest?.current_round_name || "");
   const [lockLocal, setLockLocal] = useState(contest?.round_lock_utc ? contest.round_lock_utc.slice(0, 16) : "");
 
-  // editable matchup rows
-  const [rows, setRows] = useState(() => normalizeRows(matchups));
+  // Admin management round selection (edit games/results/picks for a specific round)
+  const [manageRound, setManageRound] = useState(contest?.current_round_name || (rounds?.[0] || ""));
 
   useEffect(() => {
-    setRows(normalizeRows(matchups));
-  }, [matchups]);
+    if (contest?.current_round_name) setManageRound(contest.current_round_name);
+  }, [contest?.current_round_name]);
+
+  const matchupsInManageRound = useMemo(() => {
+    return allMatchups
+      .filter((m) => m.round_name === manageRound)
+      .sort((a, b) => (a.game_order ?? 0) - (b.game_order ?? 0));
+  }, [allMatchups, manageRound]);
+
+  const [rows, setRows] = useState(() => normalizeRows(matchupsInManageRound));
+  useEffect(() => {
+    setRows(normalizeRows(matchupsInManageRound));
+  }, [matchupsInManageRound]);
 
   function checkPw() {
     const expected = import.meta.env.VITE_ADMIN_PASSWORD || "";
@@ -622,16 +659,17 @@ function AdminPanel({ contest, matchups, onUpdated, setToast }) {
 
   async function addGame() {
     try {
-      const nextOrder = (rows.reduce((mx, r) => Math.max(mx, Number(r.game_order) || 0), 0) || 0) + 1;
+      const nextOrder =
+        (rows.reduce((mx, r) => Math.max(mx, Number(r.game_order) || 0), 0) || 0) + 1;
 
       const ins = await supabase
         .from("matchups")
         .insert([
           {
             contest_id: contest.id,
-            round_name: contest.current_round_name,
+            round_name: manageRound,
             game_order: nextOrder,
-            label: `Game ${nextOrder}`,
+            label: null,
             team_a: "Team A",
             team_b: "Team B",
             start_time_utc: null
@@ -655,10 +693,11 @@ function AdminPanel({ contest, matchups, onUpdated, setToast }) {
         .from("matchups")
         .update({
           game_order: Number(r.game_order) || 1,
-          label: r.label?.trim() ? r.label.trim() : null,
+          // labels/times removed
+          label: null,
+          start_time_utc: null,
           team_a: r.team_a?.trim() || "Team A",
-          team_b: r.team_b?.trim() || "Team B",
-          start_time_utc: r.start_time_utc ? new Date(r.start_time_utc).toISOString() : null
+          team_b: r.team_b?.trim() || "Team B"
         })
         .eq("id", r.id);
 
@@ -706,6 +745,49 @@ function AdminPanel({ contest, matchups, onUpdated, setToast }) {
     }
   }
 
+  // Admin: list submitted picks for a round
+  const picksForManageRound = useMemo(() => {
+    const ids = new Set(matchupsInManageRound.map((m) => m.id));
+    return allPicks.filter((p) => ids.has(p.matchup_id));
+  }, [allPicks, matchupsInManageRound]);
+
+  const entryById = useMemo(() => {
+    const map = new Map();
+    for (const e of entries) map.set(e.id, e);
+    return map;
+  }, [entries]);
+
+  const matchupById = useMemo(() => {
+    const map = new Map();
+    for (const m of matchupsInManageRound) map.set(m.id, m);
+    return map;
+  }, [matchupsInManageRound]);
+
+  // Build a row per entry: their picks for each game in the selected round
+  const submittedPickRows = useMemo(() => {
+    const byEntry = new Map();
+    for (const p of picksForManageRound) {
+      if (!byEntry.has(p.entry_id)) byEntry.set(p.entry_id, []);
+      byEntry.get(p.entry_id).push(p);
+    }
+
+    const rows = [];
+    for (const [entryId, picks] of byEntry.entries()) {
+      const e = entryById.get(entryId);
+      const name = e ? `${e.first_name} ${e.last_name}` : "Unknown";
+      // order picks by game_order
+      picks.sort((a, b) => {
+        const ma = matchupById.get(a.matchup_id);
+        const mb = matchupById.get(b.matchup_id);
+        return (ma?.game_order ?? 0) - (mb?.game_order ?? 0);
+      });
+      rows.push({ entryId, name, picks });
+    }
+
+    rows.sort((a, b) => a.name.localeCompare(b.name));
+    return rows;
+  }, [picksForManageRound, entryById, matchupById]);
+
   if (!authed) {
     return (
       <Card>
@@ -714,7 +796,12 @@ function AdminPanel({ contest, matchups, onUpdated, setToast }) {
 
         <div style={{ maxWidth: 420 }}>
           <div style={styles.label}>Admin password</div>
-          <input style={styles.input} type="password" value={pw} onChange={(e) => setPw(e.target.value)} />
+          <input
+            style={styles.input}
+            type="password"
+            value={pw}
+            onChange={(e) => setPw(e.target.value)}
+          />
         </div>
 
         <div style={{ marginTop: 12 }}>
@@ -729,8 +816,10 @@ function AdminPanel({ contest, matchups, onUpdated, setToast }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
       <Card>
-        <h2 style={styles.h2}>Round settings</h2>
-        <p style={styles.p}>Set the round name and the lock time (when picks close).</p>
+        <h2 style={styles.h2}>Round settings (current round)</h2>
+        <p style={styles.p}>
+          This controls what users can pick right now, and the lock time for the current round.
+        </p>
 
         <div style={styles.formRow}>
           <div style={{ flex: 1 }}>
@@ -739,7 +828,12 @@ function AdminPanel({ contest, matchups, onUpdated, setToast }) {
           </div>
           <div style={{ flex: 1 }}>
             <div style={styles.label}>Lock time (local)</div>
-            <input style={styles.input} type="datetime-local" value={lockLocal} onChange={(e) => setLockLocal(e.target.value)} />
+            <input
+              style={styles.input}
+              type="datetime-local"
+              value={lockLocal}
+              onChange={(e) => setLockLocal(e.target.value)}
+            />
           </div>
         </div>
 
@@ -751,54 +845,61 @@ function AdminPanel({ contest, matchups, onUpdated, setToast }) {
       </Card>
 
       <Card>
-        <div style={styles.adminHead}>
-          <div>
-            <h2 style={styles.h2}>Games</h2>
-            <div style={styles.p}>Add/edit matchups for the current round.</div>
-          </div>
+        <h2 style={styles.h2}>Manage a round</h2>
+        <p style={styles.p}>
+          Add games, enter results, and view submitted picks for any round (past or current).
+        </p>
+
+        <div style={{ marginTop: 10 }}>
+          <div style={styles.label}>Round</div>
+          <select style={styles.select} value={manageRound} onChange={(e) => setManageRound(e.target.value)}>
+            {rounds.map((r) => (
+              <option key={r} value={r}>
+                {r}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap" }}>
           <button style={styles.navBtn} onClick={addGame}>
             + Add game
           </button>
         </div>
 
-        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        <div style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 12 }}>
           {rows.map((r) => (
             <div key={r.id} style={styles.adminGameCard}>
-              <div style={styles.adminGrid}>
+              <div style={styles.adminGridSimple}>
                 <div>
                   <div style={styles.label}>Order</div>
-                  <input style={styles.inputSm} value={r.game_order} onChange={(e) => updateRow(r.id, { game_order: e.target.value })} />
-                </div>
-
-                <div style={{ gridColumn: "span 2" }}>
-                  <div style={styles.label}>Label</div>
-                  <input style={styles.inputSm} value={r.label} onChange={(e) => updateRow(r.id, { label: e.target.value })} />
-                </div>
-
-                <div>
-                  <div style={styles.label}>Team A</div>
-                  <input style={styles.inputSm} value={r.team_a} onChange={(e) => updateRow(r.id, { team_a: e.target.value })} />
-                </div>
-
-                <div>
-                  <div style={styles.label}>Team B</div>
-                  <input style={styles.inputSm} value={r.team_b} onChange={(e) => updateRow(r.id, { team_b: e.target.value })} />
-                </div>
-
-                <div>
-                  <div style={styles.label}>Start time (local)</div>
                   <input
                     style={styles.inputSm}
-                    type="datetime-local"
-                    value={r.start_time_utc}
-                    onChange={(e) => updateRow(r.id, { start_time_utc: e.target.value })}
+                    value={r.game_order}
+                    onChange={(e) => updateRow(r.id, { game_order: e.target.value })}
+                  />
+                </div>
+                <div>
+                  <div style={styles.label}>Team A</div>
+                  <input
+                    style={styles.inputSm}
+                    value={r.team_a}
+                    onChange={(e) => updateRow(r.id, { team_a: e.target.value })}
+                  />
+                </div>
+                <div>
+                  <div style={styles.label}>Team B</div>
+                  <input
+                    style={styles.inputSm}
+                    value={r.team_b}
+                    onChange={(e) => updateRow(r.id, { team_b: e.target.value })}
                   />
                 </div>
               </div>
 
               <div style={styles.adminActions}>
                 <button style={styles.primaryBtnSm} onClick={() => saveGame(r)}>
-                  Save game
+                  Save
                 </button>
                 <button style={styles.dangerBtnSm} onClick={() => deleteGame(r.id)}>
                   Delete
@@ -807,43 +908,54 @@ function AdminPanel({ contest, matchups, onUpdated, setToast }) {
             </div>
           ))}
 
-          {!rows.length && <div style={styles.empty}>No games yet. Click “Add game.”</div>}
+          {!rows.length && <div style={styles.empty}>No games yet for this round.</div>}
         </div>
       </Card>
 
       <Card>
-        <h2 style={styles.h2}>Results</h2>
-        <p style={styles.p}>After a game ends, set winner and score. Leaderboard updates automatically.</p>
+        <h2 style={styles.h2}>Enter results (for selected round)</h2>
+        <p style={styles.p}>Set winner and score when a game ends. Points update automatically.</p>
 
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
           {rows.map((r) => (
             <div key={r.id} style={styles.adminResultCard}>
-              <div style={{ fontWeight: 950 }}>{r.label || `Game ${r.game_order}`}</div>
-              <div style={{ color: "rgba(15,23,42,0.7)", marginTop: 4 }}>
-                {r.team_a} vs {r.team_b}
-              </div>
+              <div style={{ fontWeight: 950 }}>{r.team_a} vs {r.team_b}</div>
 
-              <div style={styles.resultGrid}>
-                <div style={{ gridColumn: "span 2" }}>
+              <div style={styles.resultGridSimple}>
+                <div style={{ flex: 2, minWidth: 220 }}>
                   <div style={styles.label}>Winner</div>
-                  <select style={styles.inputSm} value={r.winner} onChange={(e) => updateRow(r.id, { winner: e.target.value })}>
+                  <select
+                    style={styles.inputSm}
+                    value={r.winner}
+                    onChange={(e) => updateRow(r.id, { winner: e.target.value })}
+                  >
                     <option value="">Not decided</option>
                     <option value="A">{r.team_a}</option>
                     <option value="B">{r.team_b}</option>
                   </select>
                 </div>
 
-                <div>
+                <div style={{ flex: 1, minWidth: 140 }}>
                   <div style={styles.label}>{r.team_a} score</div>
-                  <input style={styles.inputSm} value={r.score_a} onChange={(e) => updateRow(r.id, { score_a: e.target.value })} inputMode="numeric" />
+                  <input
+                    style={styles.inputSm}
+                    value={r.score_a}
+                    onChange={(e) => updateRow(r.id, { score_a: e.target.value })}
+                    inputMode="numeric"
+                  />
                 </div>
 
-                <div>
+                <div style={{ flex: 1, minWidth: 140 }}>
                   <div style={styles.label}>{r.team_b} score</div>
-                  <input style={styles.inputSm} value={r.score_b} onChange={(e) => updateRow(r.id, { score_b: e.target.value })} inputMode="numeric" />
+                  <input
+                    style={styles.inputSm}
+                    value={r.score_b}
+                    onChange={(e) => updateRow(r.id, { score_b: e.target.value })}
+                    inputMode="numeric"
+                  />
                 </div>
 
-                <div style={{ display: "flex", alignItems: "end" }}>
+                <div style={{ flex: 1, minWidth: 140, display: "flex", alignItems: "end" }}>
                   <button style={styles.primaryBtnSmWide} onClick={() => saveResult(r)}>
                     Save result
                   </button>
@@ -852,28 +964,133 @@ function AdminPanel({ contest, matchups, onUpdated, setToast }) {
             </div>
           ))}
 
-          {!rows.length && <div style={styles.empty}>No games to score yet.</div>}
+          {!rows.length && <div style={styles.empty}>No games to score yet for this round.</div>}
         </div>
+      </Card>
+
+      <Card>
+        <h2 style={styles.h2}>Submitted picks (for selected round)</h2>
+        <p style={styles.p}>
+          Shows who has submitted picks and what they picked for each game in this round.
+        </p>
+
+        {!matchupsInManageRound.length ? (
+          <div style={styles.empty}>No games in this round yet.</div>
+        ) : submittedPickRows.length === 0 ? (
+          <div style={styles.empty}>No picks submitted for this round yet.</div>
+        ) : (
+          <div style={styles.picksTableWrap}>
+            <table style={styles.table}>
+              <thead>
+                <tr>
+                  <th style={styles.th}>Name</th>
+                  {matchupsInManageRound
+                    .slice()
+                    .sort((a, b) => (a.game_order ?? 0) - (b.game_order ?? 0))
+                    .map((m, idx) => (
+                      <th key={m.id} style={styles.th}>Game {idx + 1}</th>
+                    ))}
+                </tr>
+              </thead>
+              <tbody>
+                {submittedPickRows.map((row) => {
+                  const pickMap = new Map(row.picks.map((p) => [p.matchup_id, p.picked]));
+                  return (
+                    <tr key={row.entryId}>
+                      <td style={styles.tdStrong}>{row.name}</td>
+                      {matchupsInManageRound
+                        .slice()
+                        .sort((a, b) => (a.game_order ?? 0) - (b.game_order ?? 0))
+                        .map((m) => {
+                          const side = pickMap.get(m.id);
+                          const team = side ? (side === "A" ? m.team_a : m.team_b) : "—";
+                          return <td key={m.id} style={styles.td}>{team}</td>;
+                        })}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
       </Card>
     </div>
   );
 }
 
+/* ---------------- Small UI bits ---------------- */
+
+function Card({ children }) {
+  return <div style={styles.card}>{children}</div>;
+}
+
+function PickButton({ label, active, disabled, onClick }) {
+  return (
+    <button
+      style={{
+        ...styles.teamBtn,
+        ...(active ? styles.teamBtnActive : null),
+        ...(disabled ? styles.teamBtnDisabled : null)
+      }}
+      disabled={disabled}
+      onClick={onClick}
+    >
+      {label}
+    </button>
+  );
+}
+
+function StatSide({ team, pct, count, names, winning }) {
+  return (
+    <div style={{ ...styles.statCol, ...(winning ? styles.statColWinner : null) }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+        <div style={{ fontWeight: 950 }}>{team}</div>
+        <div style={{ fontWeight: 900, color: "rgba(15,23,42,0.75)" }}>
+          {pct}% ({count})
+        </div>
+      </div>
+
+      <div style={styles.barBg}>
+        <div style={{ ...styles.barFill, width: `${pct}%` }} />
+      </div>
+
+      <div style={styles.nameList}>{names.length ? names.join(", ") : "—"}</div>
+    </div>
+  );
+}
+
+function Leaderboard({ leaderboard }) {
+  return (
+    <div style={styles.board}>
+      {leaderboard.map((r, idx) => (
+        <div key={r.entry_id} style={styles.boardRow}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <div style={styles.rankPill}>{idx + 1}</div>
+            <div style={{ fontWeight: 900 }}>{r.name}</div>
+          </div>
+          <div style={{ fontWeight: 950, fontSize: 18 }}>{r.points}</div>
+        </div>
+      ))}
+      {!leaderboard.length && <div style={styles.empty}>No entries yet.</div>}
+    </div>
+  );
+}
+
+/* ---------------- Data shaping ---------------- */
+
 function normalizeRows(matchups) {
   return (matchups || []).map((m) => ({
     id: m.id,
     game_order: m.game_order,
-    label: m.label || "",
     team_a: m.team_a || "",
     team_b: m.team_b || "",
-    start_time_utc: m.start_time_utc ? m.start_time_utc.slice(0, 16) : "",
     winner: m.winner || "",
     score_a: m.score_a ?? "",
     score_b: m.score_b ?? ""
   }));
 }
 
-/* ---------------- Styles (modern, no Tailwind) ---------------- */
+/* ---------------- Styles ---------------- */
 
 const styles = {
   page: {
@@ -966,8 +1183,6 @@ const styles = {
 
   p: { margin: "8px 0 12px 0", color: "rgba(15, 23, 42, 0.75)", lineHeight: 1.45 },
 
-  tip: { marginTop: 12, fontSize: 12, color: "rgba(15,23,42,0.60)", fontWeight: 700 },
-
   label: {
     display: "block",
     fontSize: 12,
@@ -998,6 +1213,17 @@ const styles = {
     border: "1px solid rgba(15, 23, 42, 0.14)",
     outline: "none",
     fontSize: 14,
+    background: "white",
+    fontWeight: 800
+  },
+
+  select: {
+    width: "100%",
+    padding: 12,
+    borderRadius: 14,
+    border: "1px solid rgba(15, 23, 42, 0.14)",
+    outline: "none",
+    fontSize: 15,
     background: "white",
     fontWeight: 800
   },
@@ -1090,11 +1316,9 @@ const styles = {
     boxShadow: "0 8px 22px rgba(15, 23, 42, 0.06)"
   },
 
-  gameTop: { display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap" },
+  gameTop: { display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", alignItems: "center" },
 
-  gameLabel: { fontWeight: 950, fontSize: 16 },
-
-  gameMeta: { marginTop: 4, fontSize: 12, color: "rgba(15,23,42,0.65)", fontWeight: 700 },
+  gameTitle: { fontWeight: 950, fontSize: 16 },
 
   pickRow: { display: "flex", gap: 10, flexWrap: "wrap", marginTop: 12 },
 
@@ -1162,6 +1386,12 @@ const styles = {
     background: "rgba(238, 242, 255, 0.55)"
   },
 
+  // Winning team card green (readable)
+  statColWinner: {
+    background: "rgba(22, 163, 74, 0.14)",
+    border: "1px solid rgba(22, 163, 74, 0.35)"
+  },
+
   barBg: { marginTop: 10, height: 10, borderRadius: 999, background: "rgba(15,23,42,0.10)", overflow: "hidden" },
 
   barFill: { height: 10, borderRadius: 999, background: "rgba(15,23,42,0.95)" },
@@ -1195,7 +1425,45 @@ const styles = {
     fontWeight: 950
   },
 
-  adminHead: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" },
+  winnerPill: {
+    padding: "8px 10px",
+    borderRadius: 999,
+    background: "rgba(22, 163, 74, 0.12)",
+    border: "1px solid rgba(22, 163, 74, 0.30)",
+    color: "#14532d",
+    fontWeight: 900,
+    fontSize: 12
+  },
+
+  noWinnerPill: {
+    padding: "8px 10px",
+    borderRadius: 999,
+    background: "rgba(15,23,42,0.06)",
+    border: "1px solid rgba(15,23,42,0.10)",
+    color: "rgba(15,23,42,0.75)",
+    fontWeight: 900,
+    fontSize: 12
+  },
+
+  correctLine: {
+    marginTop: 10,
+    padding: "10px 12px",
+    borderRadius: 14,
+    background: "rgba(22, 163, 74, 0.12)",
+    border: "1px solid rgba(22, 163, 74, 0.30)",
+    color: "#14532d",
+    fontWeight: 950
+  },
+
+  wrongLine: {
+    marginTop: 10,
+    padding: "10px 12px",
+    borderRadius: 14,
+    background: "rgba(185, 28, 28, 0.08)",
+    border: "1px solid rgba(185, 28, 28, 0.25)",
+    color: "#7f1d1d",
+    fontWeight: 950
+  },
 
   adminGameCard: {
     border: "1px solid rgba(15,23,42,0.10)",
@@ -1204,9 +1472,9 @@ const styles = {
     background: "rgba(255,255,255,0.9)"
   },
 
-  adminGrid: {
+  adminGridSimple: {
     display: "grid",
-    gridTemplateColumns: "repeat(6, minmax(0, 1fr))",
+    gridTemplateColumns: "120px 1fr 1fr",
     gap: 10
   },
 
@@ -1219,11 +1487,31 @@ const styles = {
     background: "rgba(255,255,255,0.95)"
   },
 
-  resultGrid: {
-    display: "grid",
-    gridTemplateColumns: "repeat(6, minmax(0, 1fr))",
+  resultGridSimple: {
+    display: "flex",
     gap: 10,
+    flexWrap: "wrap",
     marginTop: 10
-  }
-};
+  },
 
+  picksTableWrap: {
+    width: "100%",
+    overflowX: "auto",
+    marginTop: 10,
+    borderRadius: 14,
+    border: "1px solid rgba(15,23,42,0.10)",
+    background: "rgba(255,255,255,0.95)"
+  },
+
+  table: { borderCollapse: "collapse", width: "100%" },
+  th: {
+    textAlign: "left",
+    padding: 12,
+    borderBottom: "1px solid rgba(15,23,42,0.08)",
+    fontSize: 12,
+    color: "rgba(15,23,42,0.65)",
+    whiteSpace: "nowrap"
+  },
+  td: { padding: 12, borderBottom: "1px solid rgba(15,23,42,0.06)", whiteSpace: "nowrap" },
+  tdStrong: { padding: 12, borderBottom: "1px solid rgba(15,23,42,0.06)", fontWeight: 950, whiteSpace: "nowrap" }
+};
