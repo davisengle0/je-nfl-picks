@@ -329,13 +329,14 @@ export default function App() {
               <>
                 <div style={styles.sectionHead}>
                   <div>
-                    <div style={styles.sectionKicker}>Your picks</div>
                     <div style={styles.sectionTitle}>
                       {me.first_name} {me.last_name}
                     </div>
                     <div style={styles.p}>
+
                       Current round: <b>{currentRoundName}</b>
                     </div>
+                    <div style={styles.autoSaveLine}>Picks auto-save</div>
                   </div>
                   <div style={locked ? styles.badgeLocked : styles.badgeOpen}>{locked ? "LOCKED" : "OPEN"}</div>
                 </div>
@@ -1271,6 +1272,14 @@ const styles = {
     fontWeight: 950,
     fontSize: 12
   },
+
+  autoSaveLine: {
+    marginTop: 6,
+    fontWeight: 950,
+    color: "#b91c1c",
+    letterSpacing: 0.2
+  },
+
   list: { display: "flex", flexDirection: "column", gap: 12, marginTop: 12 },
   empty: {
     marginTop: 12,
