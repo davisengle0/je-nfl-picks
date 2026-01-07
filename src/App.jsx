@@ -2,7 +2,8 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { supabase, normalizeName } from "./supabase";
 import { isLocked, computeLeaderboard, computeMatchupStats } from "./logic";
 
-const ADMIN_KEY = "je_picks_admin_authed";
+// Use session storage so you must re-enter password after closing the tab/browser.
+const ADMIN_KEY = "je_picks_admin_authed_session";
 
 const ROUND_ORDER = ["Wild Card", "Divisional", "Conference", "Super Bowl"];
 
@@ -64,7 +65,7 @@ export default function App() {
 
   useEffect(() => {
     if (!toast) return;
-    const t = setTimeout(() => setToast(""), 2000);
+    const t = setTimeout(() => setToast(""), 2200);
     return () => clearTimeout(t);
   }, [toast]);
 
@@ -286,23 +287,21 @@ export default function App() {
           <button style={styles.navBtn} onClick={() => setView("results")}>
             Results
           </button>
-
-          {/* Admin intentionally not in top nav */}
         </div>
       </div>
 
       <div style={styles.container}>
         {view === "home" && (
           <Card>
-            <h2 style={styles.h2}>Enter your name</h2>
+            <h2 style={styles.h2}>Name</h2>
             <p style={styles.p}>Enter your name to make picks</p>
 
             <div style={styles.formRow}>
-              <div style={{ flex: 1 }}>
+              <div style={styles.field}>
                 <div style={styles.label}>First name</div>
                 <input style={styles.input} value={first} onChange={(e) => setFirst(e.target.value)} />
               </div>
-              <div style={{ flex: 1 }}>
+              <div style={styles.field}>
                 <div style={styles.label}>Last name</div>
                 <input style={styles.input} value={last} onChange={(e) => setLast(e.target.value)} />
               </div>
@@ -314,7 +313,6 @@ export default function App() {
               </button>
             </div>
 
-            {/* Small visible admin entry point, bottom of home page */}
             <div style={styles.homeBottomRow}>
               <button style={styles.adminSmallBtn} onClick={() => setView("admin")}>
                 Admin
@@ -414,7 +412,6 @@ function ResultsHub({ me, rounds, allMatchups, entries, allPicks, leaderboard, c
   const [tab, setTab] = useState("leaderboard"); // leaderboard | round | my
   const [selectedRound, setSelectedRound] = useState(currentRoundName || rounds?.[0] || "");
 
-  // Auto show current round first
   useEffect(() => {
     if (currentRoundName) setSelectedRound(currentRoundName);
   }, [currentRoundName]);
@@ -430,7 +427,6 @@ function ResultsHub({ me, rounds, allMatchups, entries, allPicks, leaderboard, c
       .sort((a, b) => (a.game_order ?? 0) - (b.game_order ?? 0));
   }, [allMatchups, selectedRound]);
 
-  // Privacy: current round stats hidden until locked
   const hideRoundPickStats = useMemo(() => {
     const isCurrentRound = selectedRound === contest?.current_round_name;
     return isCurrentRound && !locked;
@@ -562,7 +558,17 @@ function MyPicksByRound({ me, matchups, allPicks }) {
 /* ---------------- Admin Panel ---------------- */
 
 function AdminPanel({ contest, rounds, allMatchups, entries, allPicks, onUpdated, setToast }) {
-  const [authed, setAuthed] = useState(localStorage.getItem(ADMIN_KEY) === "1");
+  // Kill any old “always authed” behavior from prior builds
+  useEffect(() => {
+    try {
+      localStorage.removeItem("je_picks_admin_authed");
+      localStorage.removeItem("je_picks_admin_authed_session");
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const [authed, setAuthed] = useState(() => sessionStorage.getItem(ADMIN_KEY) === "1");
   const [pw, setPw] = useState("");
 
   const [roundName, setRoundName] = useState(contest?.current_round_name || "");
@@ -596,12 +602,20 @@ function AdminPanel({ contest, rounds, allMatchups, entries, allPicks, onUpdated
       return;
     }
     if (pw === expected) {
-      localStorage.setItem(ADMIN_KEY, "1");
+      sessionStorage.setItem(ADMIN_KEY, "1");
       setAuthed(true);
       setToast("Admin unlocked");
+      setPw("");
     } else {
       setToast("Wrong admin password");
     }
+  }
+
+  function lockAdmin() {
+    sessionStorage.removeItem(ADMIN_KEY);
+    setAuthed(false);
+    setPw("");
+    setToast("Admin locked");
   }
 
   function updateRow(id, patch) {
@@ -767,27 +781,24 @@ function AdminPanel({ contest, rounds, allMatchups, entries, allPicks, onUpdated
     return (
       <Card>
         <h2 style={styles.h2}>Admin</h2>
-        <p style={styles.p}>Enter the admin password you set in Netlify.</p>
+        <p style={styles.p}>Enter the admin password.</p>
 
         <div style={{ maxWidth: 420 }}>
           <div style={styles.label}>Admin password</div>
-          <input style={styles.input} type="password" value={pw} onChange={(e) => setPw(e.target.value)} />
+          <input
+            style={styles.input}
+            type="password"
+            value={pw}
+            onChange={(e) => setPw(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") checkPw();
+            }}
+          />
         </div>
 
-        <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap" }}>
+        <div style={{ marginTop: 12 }}>
           <button style={styles.primaryBtn} onClick={checkPw}>
             Unlock Admin
-          </button>
-          <button
-            style={styles.navBtn}
-            onClick={() => {
-              localStorage.removeItem(ADMIN_KEY);
-              setAuthed(false);
-              setPw("");
-              setToast("Admin locked");
-            }}
-          >
-            Lock Admin
           </button>
         </div>
       </Card>
@@ -802,15 +813,7 @@ function AdminPanel({ contest, rounds, allMatchups, entries, allPicks, onUpdated
             <h2 style={{ ...styles.h2, marginBottom: 0 }}>Admin</h2>
             <div style={styles.p}>Manage the current round lock, games, results, and view submitted picks.</div>
           </div>
-          <button
-            style={styles.navBtn}
-            onClick={() => {
-              localStorage.removeItem(ADMIN_KEY);
-              setAuthed(false);
-              setPw("");
-              setToast("Admin locked");
-            }}
-          >
+          <button style={styles.navBtn} onClick={lockAdmin}>
             Lock Admin
           </button>
         </div>
@@ -820,11 +823,11 @@ function AdminPanel({ contest, rounds, allMatchups, entries, allPicks, onUpdated
         <h2 style={styles.h2}>Round settings (current round)</h2>
 
         <div style={styles.formRow}>
-          <div style={{ flex: 1 }}>
+          <div style={styles.field}>
             <div style={styles.label}>Current round name</div>
             <input style={styles.input} value={roundName} onChange={(e) => setRoundName(e.target.value)} />
           </div>
-          <div style={{ flex: 1 }}>
+          <div style={styles.field}>
             <div style={styles.label}>Lock time (local)</div>
             <input style={styles.input} type="datetime-local" value={lockLocal} onChange={(e) => setLockLocal(e.target.value)} />
           </div>
@@ -1044,8 +1047,6 @@ function Leaderboard({ leaderboard }) {
   );
 }
 
-/* ---------------- Data shaping ---------------- */
-
 function normalizeRows(matchups) {
   return (matchups || []).map((m) => ({
     id: m.id,
@@ -1067,7 +1068,6 @@ const styles = {
     background: "linear-gradient(180deg, #f7f8fb 0%, #eef2ff 100%)",
     color: "#0f172a"
   },
-
   loading: {
     minHeight: "100vh",
     display: "flex",
@@ -1078,7 +1078,6 @@ const styles = {
     color: "#0f172a",
     fontWeight: 800
   },
-
   toast: {
     position: "fixed",
     top: 14,
@@ -1091,9 +1090,12 @@ const styles = {
     borderRadius: 999,
     boxShadow: "0 10px 25px rgba(15,23,42,0.25)",
     fontWeight: 800,
-    fontSize: 13
+    fontSize: 13,
+    maxWidth: "92vw",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis"
   },
-
   topbar: {
     position: "sticky",
     top: 0,
@@ -1108,12 +1110,9 @@ const styles = {
     gap: 12,
     flexWrap: "wrap"
   },
-
   brand: { fontWeight: 950, fontSize: 16, letterSpacing: -0.2 },
   subhead: { marginTop: 4, fontSize: 12, color: "rgba(15,23,42,0.70)" },
-
   nav: { display: "flex", gap: 8, flexWrap: "wrap" },
-
   navBtn: {
     padding: "10px 12px",
     borderRadius: 14,
@@ -1122,7 +1121,6 @@ const styles = {
     fontWeight: 900,
     cursor: "pointer"
   },
-
   navBtnDisabled: {
     padding: "10px 12px",
     borderRadius: 14,
@@ -1131,13 +1129,7 @@ const styles = {
     fontWeight: 900,
     color: "rgba(15,23,42,0.35)"
   },
-
-  container: {
-    maxWidth: 1050,
-    margin: "0 auto",
-    padding: "18px 14px 40px"
-  },
-
+  container: { maxWidth: 1050, margin: "0 auto", padding: "18px 14px 40px" },
   card: {
     border: "1px solid rgba(15, 23, 42, 0.10)",
     borderRadius: 18,
@@ -1145,9 +1137,7 @@ const styles = {
     background: "rgba(255, 255, 255, 0.92)",
     boxShadow: "0 10px 30px rgba(15, 23, 42, 0.08)"
   },
-
   homeBottomRow: { marginTop: 18, display: "flex", justifyContent: "flex-end" },
-
   adminSmallBtn: {
     padding: "8px 10px",
     borderRadius: 12,
@@ -1158,11 +1148,8 @@ const styles = {
     fontSize: 12,
     color: "rgba(15,23,42,0.75)"
   },
-
   h2: { margin: "0 0 8px 0", fontSize: 22, fontWeight: 950, letterSpacing: -0.25 },
-
   p: { margin: "8px 0 12px 0", color: "rgba(15, 23, 42, 0.75)", lineHeight: 1.45 },
-
   label: {
     display: "block",
     fontSize: 12,
@@ -1174,10 +1161,26 @@ const styles = {
     letterSpacing: 0.7
   },
 
-  formRow: { display: "flex", gap: 12, flexWrap: "wrap" },
+  // FIX: prevent overlap and overflow in the home page fields
+  formRow: {
+    display: "flex",
+    gap: 12,
+    flexWrap: "wrap",
+    alignItems: "stretch",
+    maxWidth: "100%",
+    boxSizing: "border-box"
+  },
+  field: {
+    flex: "1 1 260px",
+    minWidth: 240,
+    maxWidth: "100%",
+    boxSizing: "border-box"
+  },
 
   input: {
     width: "100%",
+    maxWidth: "100%",
+    boxSizing: "border-box",
     padding: 12,
     borderRadius: 14,
     border: "1px solid rgba(15, 23, 42, 0.14)",
@@ -1185,9 +1188,10 @@ const styles = {
     fontSize: 16,
     background: "white"
   },
-
   inputSm: {
     width: "100%",
+    maxWidth: "100%",
+    boxSizing: "border-box",
     padding: "10px 10px",
     borderRadius: 14,
     border: "1px solid rgba(15, 23, 42, 0.14)",
@@ -1196,9 +1200,10 @@ const styles = {
     background: "white",
     fontWeight: 800
   },
-
   select: {
     width: "100%",
+    maxWidth: "100%",
+    boxSizing: "border-box",
     padding: 12,
     borderRadius: 14,
     border: "1px solid rgba(15, 23, 42, 0.14)",
@@ -1207,7 +1212,6 @@ const styles = {
     background: "white",
     fontWeight: 800
   },
-
   primaryBtn: {
     padding: "12px 14px",
     borderRadius: 14,
@@ -1218,7 +1222,6 @@ const styles = {
     cursor: "pointer",
     boxShadow: "0 10px 18px rgba(15, 23, 42, 0.16)"
   },
-
   primaryBtnSm: {
     padding: "10px 12px",
     borderRadius: 14,
@@ -1228,7 +1231,6 @@ const styles = {
     fontWeight: 950,
     cursor: "pointer"
   },
-
   primaryBtnSmWide: {
     width: "100%",
     padding: "10px 12px",
@@ -1239,7 +1241,6 @@ const styles = {
     fontWeight: 950,
     cursor: "pointer"
   },
-
   dangerBtnSm: {
     padding: "10px 12px",
     borderRadius: 14,
@@ -1249,13 +1250,9 @@ const styles = {
     fontWeight: 950,
     cursor: "pointer"
   },
-
   sectionHead: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, flexWrap: "wrap" },
-
   sectionKicker: { fontSize: 12, fontWeight: 950, color: "rgba(15,23,42,0.60)", textTransform: "uppercase", letterSpacing: 0.7 },
-
   sectionTitle: { fontSize: 22, fontWeight: 950, letterSpacing: -0.25, marginTop: 2 },
-
   badgeOpen: {
     padding: "8px 10px",
     borderRadius: 999,
@@ -1265,7 +1262,6 @@ const styles = {
     fontWeight: 950,
     fontSize: 12
   },
-
   badgeLocked: {
     padding: "8px 10px",
     borderRadius: 999,
@@ -1275,9 +1271,7 @@ const styles = {
     fontWeight: 950,
     fontSize: 12
   },
-
   list: { display: "flex", flexDirection: "column", gap: 12, marginTop: 12 },
-
   empty: {
     marginTop: 12,
     padding: 14,
@@ -1287,7 +1281,6 @@ const styles = {
     color: "rgba(15,23,42,0.7)",
     fontWeight: 800
   },
-
   gameCard: {
     border: "1px solid rgba(15, 23, 42, 0.10)",
     borderRadius: 18,
@@ -1295,13 +1288,9 @@ const styles = {
     background: "rgba(255, 255, 255, 0.95)",
     boxShadow: "0 8px 22px rgba(15, 23, 42, 0.06)"
   },
-
   gameTop: { display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", alignItems: "center" },
-
   gameTitle: { fontWeight: 950, fontSize: 16 },
-
   pickRow: { display: "flex", gap: 10, flexWrap: "wrap", marginTop: 12 },
-
   teamBtn: {
     flex: 1,
     minWidth: 220,
@@ -1315,16 +1304,13 @@ const styles = {
     fontSize: 16,
     boxShadow: "0 6px 16px rgba(15, 23, 42, 0.06)"
   },
-
   teamBtnActive: {
     background: "rgba(15,23,42,0.95)",
     color: "white",
     border: "1px solid rgba(15,23,42,0.95)",
     boxShadow: "0 10px 20px rgba(15,23,42,0.18)"
   },
-
   teamBtnDisabled: { opacity: 0.65, cursor: "not-allowed" },
-
   tabs: {
     marginTop: 10,
     display: "inline-flex",
@@ -1334,7 +1320,6 @@ const styles = {
     border: "1px solid rgba(15,23,42,0.10)",
     background: "rgba(255,255,255,0.75)"
   },
-
   tab: {
     padding: "10px 12px",
     borderRadius: 12,
@@ -1344,7 +1329,6 @@ const styles = {
     cursor: "pointer",
     color: "rgba(15,23,42,0.75)"
   },
-
   tabActive: {
     padding: "10px 12px",
     borderRadius: 12,
@@ -1354,9 +1338,7 @@ const styles = {
     cursor: "pointer",
     color: "white"
   },
-
   statsRow: { display: "flex", gap: 12, flexWrap: "wrap", marginTop: 12 },
-
   statCol: {
     flex: 1,
     minWidth: 260,
@@ -1365,113 +1347,26 @@ const styles = {
     padding: 12,
     background: "rgba(238, 242, 255, 0.55)"
   },
-
   statColWinner: {
     background: "rgba(22, 163, 74, 0.14)",
     border: "1px solid rgba(22, 163, 74, 0.35)"
   },
-
   barBg: { marginTop: 10, height: 10, borderRadius: 999, background: "rgba(15,23,42,0.10)", overflow: "hidden" },
-
   barFill: { height: 10, borderRadius: 999, background: "rgba(15,23,42,0.95)" },
-
   nameList: { marginTop: 10, fontSize: 12, color: "rgba(15, 23, 42, 0.78)", lineHeight: 1.5 },
+  board: { border: "1px solid rgba(15,23,42,0.10)", borderRadius: 18, overflow: "hidden", background: "rgba(255,255,255,0.95)" },
+  boardRow: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: 14, borderBottom: "1px solid rgba(15,23,42,0.06)" },
+  rankPill: { width: 34, height: 34, borderRadius: 14, background: "rgba(15,23,42,0.95)", color: "white", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 950 },
+  winnerPill: { padding: "8px 10px", borderRadius: 999, background: "rgba(22, 163, 74, 0.12)", border: "1px solid rgba(22, 163, 74, 0.30)", color: "#14532d", fontWeight: 900, fontSize: 12 },
+  noWinnerPill: { padding: "8px 10px", borderRadius: 999, background: "rgba(15,23,42,0.06)", border: "1px solid rgba(15,23,42,0.10)", color: "rgba(15,23,42,0.75)", fontWeight: 900, fontSize: 12 },
+  correctLine: { marginTop: 10, padding: "10px 12px", borderRadius: 14, background: "rgba(22, 163, 74, 0.12)", border: "1px solid rgba(22, 163, 74, 0.30)", color: "#14532d", fontWeight: 950 },
+  incorrectLine: { marginTop: 10, padding: "10px 12px", borderRadius: 14, background: "rgba(185, 28, 28, 0.08)", border: "1px solid rgba(185, 28, 28, 0.25)", color: "#7f1d1d", fontWeight: 950 },
 
-  board: {
-    border: "1px solid rgba(15,23,42,0.10)",
-    borderRadius: 18,
-    overflow: "hidden",
-    background: "rgba(255,255,255,0.95)"
-  },
-
-  boardRow: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    padding: 14,
-    borderBottom: "1px solid rgba(15,23,42,0.06)"
-  },
-
-  rankPill: {
-    width: 34,
-    height: 34,
-    borderRadius: 14,
-    background: "rgba(15,23,42,0.95)",
-    color: "white",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    fontWeight: 950
-  },
-
-  winnerPill: {
-    padding: "8px 10px",
-    borderRadius: 999,
-    background: "rgba(22, 163, 74, 0.12)",
-    border: "1px solid rgba(22, 163, 74, 0.30)",
-    color: "#14532d",
-    fontWeight: 900,
-    fontSize: 12
-  },
-
-  noWinnerPill: {
-    padding: "8px 10px",
-    borderRadius: 999,
-    background: "rgba(15,23,42,0.06)",
-    border: "1px solid rgba(15,23,42,0.10)",
-    color: "rgba(15,23,42,0.75)",
-    fontWeight: 900,
-    fontSize: 12
-  },
-
-  correctLine: {
-    marginTop: 10,
-    padding: "10px 12px",
-    borderRadius: 14,
-    background: "rgba(22, 163, 74, 0.12)",
-    border: "1px solid rgba(22, 163, 74, 0.30)",
-    color: "#14532d",
-    fontWeight: 950
-  },
-
-  incorrectLine: {
-    marginTop: 10,
-    padding: "10px 12px",
-    borderRadius: 14,
-    background: "rgba(185, 28, 28, 0.08)",
-    border: "1px solid rgba(185, 28, 28, 0.25)",
-    color: "#7f1d1d",
-    fontWeight: 950
-  },
-
-  adminGameCard: {
-    border: "1px solid rgba(15,23,42,0.10)",
-    borderRadius: 18,
-    padding: 14,
-    background: "rgba(255,255,255,0.9)"
-  },
-
-  adminGridSimple: {
-    display: "grid",
-    gridTemplateColumns: "120px 1fr 1fr",
-    gap: 10
-  },
-
+  adminGameCard: { border: "1px solid rgba(15,23,42,0.10)", borderRadius: 18, padding: 14, background: "rgba(255,255,255,0.9)" },
+  adminGridSimple: { display: "grid", gridTemplateColumns: "120px 1fr 1fr", gap: 10 },
   adminActions: { display: "flex", gap: 10, flexWrap: "wrap", marginTop: 10 },
-
-  adminResultCard: {
-    border: "1px solid rgba(15,23,42,0.10)",
-    borderRadius: 18,
-    padding: 14,
-    background: "rgba(255,255,255,0.95)"
-  },
-
-  resultGridSimple: {
-    display: "flex",
-    gap: 10,
-    flexWrap: "wrap",
-    marginTop: 10
-  },
+  adminResultCard: { border: "1px solid rgba(15,23,42,0.10)", borderRadius: 18, padding: 14, background: "rgba(255,255,255,0.95)" },
+  resultGridSimple: { display: "flex", gap: 10, flexWrap: "wrap", marginTop: 10 },
 
   picksTableWrap: {
     width: "100%",
@@ -1481,16 +1376,8 @@ const styles = {
     border: "1px solid rgba(15,23,42,0.10)",
     background: "rgba(255,255,255,0.95)"
   },
-
   table: { borderCollapse: "collapse", width: "100%" },
-  th: {
-    textAlign: "left",
-    padding: 12,
-    borderBottom: "1px solid rgba(15,23,42,0.08)",
-    fontSize: 12,
-    color: "rgba(15,23,42,0.65)",
-    whiteSpace: "nowrap"
-  },
+  th: { textAlign: "left", padding: 12, borderBottom: "1px solid rgba(15,23,42,0.08)", fontSize: 12, color: "rgba(15,23,42,0.65)", whiteSpace: "nowrap" },
   td: { padding: 12, borderBottom: "1px solid rgba(15,23,42,0.06)", whiteSpace: "nowrap" },
   tdStrong: { padding: 12, borderBottom: "1px solid rgba(15,23,42,0.06)", fontWeight: 950, whiteSpace: "nowrap" }
 };
