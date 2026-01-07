@@ -16,12 +16,14 @@ function matchupTitle(m) {
   return `${m.team_a} at ${m.team_b}`;
 }
 
-function formatLocalTimeOnly(isoUtc) {
+function formatLocalLock(isoUtc) {
   if (!isoUtc) return "Not set";
   try {
     const d = new Date(isoUtc);
-    // "7:00 PM" style
-    return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    const time = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }); // 7:00 PM
+    const month = d.getMonth() + 1;
+    const day = d.getDate();
+    return `${month}/${day} ${time}`; // 1/6 7:00 PM
   } catch {
     return "Not set";
   }
@@ -58,7 +60,7 @@ export default function App() {
 
   const locked = useMemo(() => isLocked(contest?.round_lock_utc), [contest?.round_lock_utc]);
   const currentRoundName = contest?.current_round_name || "Current Round";
-  const lockTimeOnly = useMemo(() => formatLocalTimeOnly(contest?.round_lock_utc), [contest?.round_lock_utc]);
+  const lockText = useMemo(() => formatLocalLock(contest?.round_lock_utc), [contest?.round_lock_utc]);
 
   useEffect(() => {
     if (!toast) return;
@@ -154,8 +156,6 @@ export default function App() {
       return;
     }
 
-    // IMPORTANT: make case-insensitive by normalizing inputs.
-    // normalizeName should already lower-case; we also pass lowercased values.
     const nk = normalizeName(fnRaw.toLowerCase(), lnRaw.toLowerCase());
 
     const existing = await supabase
@@ -174,17 +174,13 @@ export default function App() {
     let entry = existing.data;
 
     if (!entry) {
-      // Store names nicely (capitalize first letters) without affecting lookup key.
-      const prettyFirst = fnRaw;
-      const prettyLast = lnRaw;
-
       const ins = await supabase
         .from("entries")
         .insert([
           {
             contest_id: contest.id,
-            first_name: prettyFirst,
-            last_name: prettyLast,
+            first_name: fnRaw,
+            last_name: lnRaw,
             name_key: nk
           }
         ])
@@ -266,7 +262,7 @@ export default function App() {
         <div>
           <div style={styles.brand}>JECH NFL Playoff Picks</div>
           <div style={styles.subhead}>
-            Current round: <b>{currentRoundName}</b> • Locks: <b>{lockTimeOnly}</b> •{" "}
+            Current round: <b>{currentRoundName}</b> • Locks: <b>{lockText}</b> •{" "}
             <span style={{ color: locked ? "#b91c1c" : "#166534", fontWeight: 900 }}>
               {locked ? "LOCKED" : "OPEN"}
             </span>
@@ -283,16 +279,14 @@ export default function App() {
             onClick={() => setView("picks")}
             disabled={!me}
           >
-            Picks
+            My Picks
           </button>
 
           <button style={styles.navBtn} onClick={() => setView("results")}>
             Results
           </button>
 
-          <button style={styles.navBtn} onClick={() => setView("admin")}>
-            Admin
-          </button>
+          {/* Admin removed from top nav */}
         </div>
       </div>
 
@@ -328,6 +322,14 @@ export default function App() {
                 Continue
               </button>
             </div>
+
+            {/* Hidden admin access: bottom-right of home page only */}
+            <button
+              aria-label="Admin"
+              title="Admin"
+              onClick={() => setView("admin")}
+              style={styles.adminHiddenBtn}
+            />
           </Card>
         )}
 
@@ -398,6 +400,7 @@ export default function App() {
             leaderboard={leaderboard}
             contest={contest}
             locked={locked}
+            currentRoundName={currentRoundName}
           />
         )}
 
@@ -419,12 +422,27 @@ export default function App() {
 
 /* ---------------- Results Hub ---------------- */
 
-function ResultsHub({ me, rounds, allMatchups, entries, allPicks, leaderboard, contest, locked }) {
+function ResultsHub({
+  me,
+  rounds,
+  allMatchups,
+  entries,
+  allPicks,
+  leaderboard,
+  contest,
+  locked,
+  currentRoundName
+}) {
   const [tab, setTab] = useState("leaderboard"); // leaderboard | round | my
-  const [selectedRound, setSelectedRound] = useState(rounds?.[0] || "");
+  const [selectedRound, setSelectedRound] = useState(currentRoundName || rounds?.[0] || "");
+
+  // Auto-show current round first whenever it changes or rounds load
+  useEffect(() => {
+    if (currentRoundName) setSelectedRound(currentRoundName);
+  }, [currentRoundName]);
 
   useEffect(() => {
-    if (!selectedRound && rounds?.length) setSelectedRound(rounds[0]);
+    if (!selectedRound && rounds?.length) setSelectedRound(currentRoundName || rounds[0]);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rounds?.length]);
 
@@ -434,8 +452,7 @@ function ResultsHub({ me, rounds, allMatchups, entries, allPicks, leaderboard, c
       .sort((a, b) => (a.game_order ?? 0) - (b.game_order ?? 0));
   }, [allMatchups, selectedRound]);
 
-  // Privacy rule: if viewing the CURRENT round and it is NOT locked yet,
-  // do NOT show pick percentages or names for that round.
+  // Privacy: current round stats hidden until locked
   const hideRoundPickStats = useMemo(() => {
     const isCurrentRound = selectedRound === contest?.current_round_name;
     return isCurrentRound && !locked;
@@ -450,7 +467,10 @@ function ResultsHub({ me, rounds, allMatchups, entries, allPicks, leaderboard, c
       </div>
 
       <div style={styles.tabs}>
-        <button style={tab === "leaderboard" ? styles.tabActive : styles.tab} onClick={() => setTab("leaderboard")}>
+        <button
+          style={tab === "leaderboard" ? styles.tabActive : styles.tab}
+          onClick={() => setTab("leaderboard")}
+        >
           Leaderboard
         </button>
         <button style={tab === "round" ? styles.tabActive : styles.tab} onClick={() => setTab("round")}>
@@ -486,29 +506,17 @@ function ResultsHub({ me, rounds, allMatchups, entries, allPicks, leaderboard, c
           />
         )}
 
-        {tab === "my" && (
-          <MyPicksByRound
-            me={me}
-            matchups={matchupsInRound}
-            allPicks={allPicks}
-          />
-        )}
+        {tab === "my" && <MyPicksByRound me={me} matchups={matchupsInRound} allPicks={allPicks} />}
       </div>
     </Card>
   );
 }
 
 function RoundStats({ matchups, entries, allPicks, hidePickStats }) {
-  if (!matchups.length) {
-    return <div style={styles.empty}>No games found for this round yet.</div>;
-  }
+  if (!matchups.length) return <div style={styles.empty}>No games found for this round yet.</div>;
 
   if (hidePickStats) {
-    return (
-      <div style={styles.empty}>
-        Picks are hidden until this round locks.
-      </div>
-    );
+    return <div style={styles.empty}>Picks are hidden until this round locks.</div>;
   }
 
   return (
@@ -516,7 +524,6 @@ function RoundStats({ matchups, entries, allPicks, hidePickStats }) {
       {matchups.map((m) => {
         const picksForMatchup = allPicks.filter((p) => p.matchup_id === m.id);
         const s = computeMatchupStats(m, entries, picksForMatchup);
-
         const hasWinner = !!m.winner;
 
         return (
@@ -559,7 +566,6 @@ function MyPicksByRound({ me, matchups, allPicks }) {
         const pickedSide = pickByMatchup.get(m.id);
         const pickedTeam = pickedSide ? (pickedSide === "A" ? m.team_a : m.team_b) : "(no pick)";
         const hasWinner = !!m.winner;
-
         const correct = hasWinner ? pickedSide === m.winner : null;
 
         return (
@@ -893,7 +899,9 @@ function AdminPanel({ contest, rounds, allMatchups, entries, allPicks, onUpdated
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
           {rows.map((r) => (
             <div key={r.id} style={styles.adminResultCard}>
-              <div style={{ fontWeight: 950 }}>{r.team_a} at {r.team_b}</div>
+              <div style={{ fontWeight: 950 }}>
+                {r.team_a} at {r.team_b}
+              </div>
 
               <div style={styles.resultGridSimple}>
                 <div style={{ flex: 2, minWidth: 220 }}>
@@ -945,7 +953,9 @@ function AdminPanel({ contest, rounds, allMatchups, entries, allPicks, onUpdated
                     .slice()
                     .sort((a, b) => (a.game_order ?? 0) - (b.game_order ?? 0))
                     .map((m, idx) => (
-                      <th key={m.id} style={styles.th}>Game {idx + 1}</th>
+                      <th key={m.id} style={styles.th}>
+                        Game {idx + 1}
+                      </th>
                     ))}
                 </tr>
               </thead>
@@ -961,7 +971,11 @@ function AdminPanel({ contest, rounds, allMatchups, entries, allPicks, onUpdated
                         .map((m) => {
                           const side = pickMap.get(m.id);
                           const team = side ? (side === "A" ? m.team_a : m.team_b) : "—";
-                          return <td key={m.id} style={styles.td}>{team}</td>;
+                          return (
+                            <td key={m.id} style={styles.td}>
+                              {team}
+                            </td>
+                          );
                         })}
                     </tr>
                   );
@@ -1129,11 +1143,26 @@ const styles = {
   },
 
   card: {
+    position: "relative",
     border: "1px solid rgba(15, 23, 42, 0.10)",
     borderRadius: 18,
     padding: 18,
     background: "rgba(255, 255, 255, 0.92)",
     boxShadow: "0 10px 30px rgba(15, 23, 42, 0.08)"
+  },
+
+  // Hidden admin button: invisible but clickable in bottom-right
+  adminHiddenBtn: {
+    position: "absolute",
+    right: 10,
+    bottom: 10,
+    width: 34,
+    height: 34,
+    borderRadius: 10,
+    border: "none",
+    background: "transparent",
+    cursor: "pointer",
+    opacity: 0.02 // practically invisible; still clickable
   },
 
   h2: { margin: "0 0 8px 0", fontSize: 22, fontWeight: 950, letterSpacing: -0.25 },
