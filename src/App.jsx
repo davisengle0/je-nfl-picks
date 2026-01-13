@@ -333,7 +333,6 @@ export default function App() {
                       {me.first_name} {me.last_name}
                     </div>
                     <div style={styles.p}>
-
                       Current round: <b>{currentRoundName}</b>
                     </div>
                     <div style={styles.autoSaveLine}>Picks auto-save</div>
@@ -1031,18 +1030,32 @@ function StatSide({ team, pct, count, names, winning }) {
   );
 }
 
+/**
+ * FIX: leaderboard ranking with ties (competition ranking)
+ * Example points: 10,10,9,8,8,7 => ranks: 1,1,3,4,4,6
+ */
 function Leaderboard({ leaderboard }) {
+  let lastPoints = null;
+  let displayRank = 0;
+
   return (
     <div style={styles.board}>
-      {leaderboard.map((r, idx) => (
-        <div key={r.entry_id} style={styles.boardRow}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <div style={styles.rankPill}>{idx + 1}</div>
-            <div style={{ fontWeight: 900 }}>{r.name}</div>
+      {leaderboard.map((r, idx) => {
+        if (lastPoints === null || r.points !== lastPoints) {
+          displayRank = idx + 1;
+          lastPoints = r.points;
+        }
+
+        return (
+          <div key={r.entry_id} style={styles.boardRow}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div style={styles.rankPill}>{displayRank}</div>
+              <div style={{ fontWeight: 900 }}>{r.name}</div>
+            </div>
+            <div style={{ fontWeight: 950, fontSize: 18 }}>{r.points}</div>
           </div>
-          <div style={{ fontWeight: 950, fontSize: 18 }}>{r.points}</div>
-        </div>
-      ))}
+        );
+      })}
       {!leaderboard.length && <div style={styles.empty}>No entries yet.</div>}
     </div>
   );
@@ -1162,7 +1175,6 @@ const styles = {
     letterSpacing: 0.7
   },
 
-  // FIX: prevent overlap and overflow in the home page fields
   formRow: {
     display: "flex",
     gap: 12,
@@ -1252,7 +1264,6 @@ const styles = {
     cursor: "pointer"
   },
   sectionHead: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, flexWrap: "wrap" },
-  sectionKicker: { fontSize: 12, fontWeight: 950, color: "rgba(15,23,42,0.60)", textTransform: "uppercase", letterSpacing: 0.7 },
   sectionTitle: { fontSize: 22, fontWeight: 950, letterSpacing: -0.25, marginTop: 2 },
   badgeOpen: {
     padding: "8px 10px",
