@@ -58,6 +58,7 @@ export default function App() {
   const [me, setMe] = useState(null);
 
   const [myPicks, setMyPicks] = useState({}); // matchup_id -> 'A' | 'B'
+  const [sbGuess, setSbGuess] = useState(""); // Super Bowl total points guess (tie-breaker)
 
   const locked = useMemo(() => isLocked(contest?.round_lock_utc), [contest?.round_lock_utc]);
   const currentRoundName = contest?.current_round_name || "Current Round";
@@ -198,6 +199,7 @@ export default function App() {
     }
 
     setMe(entry);
+    setSbGuess(entry.sb_total_points_guess ?? "");
 
     const mp = await supabase
       .from("picks")
@@ -248,6 +250,39 @@ export default function App() {
       return;
     }
 
+    setToast("Saved");
+    await loadAll({ showSpinner: false });
+  }
+
+  async function saveSbGuess(value) {
+    if (!me) return;
+    if (locked) {
+      setToast("Locked — can’t change Super Bowl guess.");
+      return;
+    }
+
+    const raw = (value ?? "").toString().trim();
+
+    // allow blank to clear
+    let toSave = null;
+
+    if (raw !== "") {
+      const n = Number(raw);
+      if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0 || n > 200) {
+        setToast("Enter a whole number 0–200 for total points.");
+        return;
+      }
+      toSave = n;
+    }
+
+    const up = await supabase.from("entries").update({ sb_total_points_guess: toSave }).eq("id", me.id);
+    if (up.error) {
+      setToast(`Save error: ${up.error.message}`);
+      return;
+    }
+
+    // Keep local me in sync
+    setMe((prev) => (prev ? { ...prev, sb_total_points_guess: toSave } : prev));
     setToast("Saved");
     await loadAll({ showSpinner: false });
   }
@@ -336,7 +371,28 @@ export default function App() {
                       Current round: <b>{currentRoundName}</b>
                     </div>
                     <div style={styles.autoSaveLine}>Picks auto-save</div>
+
+                    {currentRoundName === "Super Bowl" && (
+                      <div style={{ marginTop: 12, maxWidth: 420 }}>
+                        <div style={styles.label}>Super Bowl total points (both teams)</div>
+                        <input
+                          style={styles.input}
+                          inputMode="numeric"
+                          value={sbGuess}
+                          disabled={locked}
+                          onChange={(e) => setSbGuess(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") saveSbGuess(sbGuess);
+                          }}
+                          onBlur={() => saveSbGuess(sbGuess)}
+                        />
+                        <div style={{ marginTop: 6, fontSize: 12, color: "rgba(15,23,42,0.65)", fontWeight: 800 }}>
+                          Used as tie-breaker for players tied on total points.
+                        </div>
+                      </div>
+                    )}
                   </div>
+
                   <div style={locked ? styles.badgeLocked : styles.badgeOpen}>{locked ? "LOCKED" : "OPEN"}</div>
                 </div>
 
@@ -469,7 +525,12 @@ function ResultsHub({ me, rounds, allMatchups, entries, allPicks, leaderboard, c
         {tab === "leaderboard" && <Leaderboard leaderboard={leaderboard} />}
 
         {tab === "round" && (
-          <RoundStats matchups={matchupsInRound} entries={entries} allPicks={allPicks} hidePickStats={hideRoundPickStats} />
+          <RoundStats
+            matchups={matchupsInRound}
+            entries={entries}
+            allPicks={allPicks}
+            hidePickStats={hideRoundPickStats}
+          />
         )}
 
         {tab === "my" && <MyPicksByRound me={me} matchups={matchupsInRound} allPicks={allPicks} />}
@@ -486,7 +547,10 @@ function RoundStats({ matchups, entries, allPicks, hidePickStats }) {
     <div style={styles.list}>
       {matchups.map((m) => {
         const picksForMatchup = allPicks.filter((p) => p.matchup_id === m.id);
-        const s = computeMatchupStats(m, entries, picksForMatchup);
+
+        // ✅ include Super Bowl guess after names for SB round only
+        const s = computeMatchupStats(m, entries, picksForMatchup, { includeSbGuess: true });
+
         const hasWinner = !!m.winner;
 
         return (
@@ -547,7 +611,11 @@ function MyPicksByRound({ me, matchups, allPicks }) {
               Your pick: <b>{pickedTeam}</b>
             </div>
 
-            {hasWinner && <div style={correct ? styles.correctLine : styles.incorrectLine}>{correct ? "Correct (+1)" : "Incorrect (+0)"}</div>}
+            {hasWinner && (
+              <div style={correct ? styles.correctLine : styles.incorrectLine}>
+                {correct ? "Correct (+1)" : "Incorrect (+0)"}
+              </div>
+            )}
           </div>
         );
       })}
@@ -1031,19 +1099,31 @@ function StatSide({ team, pct, count, names, winning }) {
 }
 
 /**
- * FIX: leaderboard ranking with ties (competition ranking)
- * Example points: 10,10,9,8,8,7 => ranks: 1,1,3,4,4,6
+ * Leaderboard ranks:
+ * - Always rank by the actual displayed ordering.
+ * - Before SB is scored: ties share rank if points equal.
+ * - After SB is scored: ties are broken by guess diff, so ranks will split unless diff is also equal.
  */
 function Leaderboard({ leaderboard }) {
-  let lastPoints = null;
+  let lastKey = null;
   let displayRank = 0;
 
   return (
     <div style={styles.board}>
       {leaderboard.map((r, idx) => {
-        if (lastPoints === null || r.points !== lastPoints) {
+        const pts = Number(r.points);
+        const tbActive = !!r.tb_active;
+
+        // Ranking key:
+        // - before tie-break active: points only
+        // - after active: points + diff (so ties break correctly)
+        const diffKey =
+          tbActive ? (r.sb_diff == null ? "INF" : String(Number(r.sb_diff))) : "NA";
+        const key = tbActive ? `${pts}|${diffKey}` : `${pts}`;
+
+        if (lastKey === null || key !== lastKey) {
           displayRank = idx + 1;
-          lastPoints = r.points;
+          lastKey = key;
         }
 
         return (
@@ -1052,7 +1132,7 @@ function Leaderboard({ leaderboard }) {
               <div style={styles.rankPill}>{displayRank}</div>
               <div style={{ fontWeight: 900 }}>{r.name}</div>
             </div>
-            <div style={{ fontWeight: 950, fontSize: 18 }}>{r.points}</div>
+            <div style={{ fontWeight: 950, fontSize: 18 }}>{pts}</div>
           </div>
         );
       })}
